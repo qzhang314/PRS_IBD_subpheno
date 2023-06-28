@@ -1,0 +1,544 @@
+---
+title: "Detecting whether IBD polygenic risk score (based on selected variants) varies between IBD subgroups"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: united
+    highlight: tango
+    number_sections: true
+
+# output:
+#   bookdown::html_document2:
+#     toc: true
+#     toc_float: true
+#     toc_depth: 4
+#     theme: united
+#     highlight: tango
+#     number_sections: true
+#     fig_caption: true
+date: "on `r format(Sys.time(), '%d %B, %Y')`"
+author: "by Qian Zhang"
+---
+
+
+<style type="text/css">
+
+h1.title {
+  font-size: 38px;
+  color: Black;
+  text-align: left;
+}
+h4.author { /* Header 4 - and the author and data headers use this too  */
+    font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: Black;
+  text-align: left;
+}
+
+h4.date { /* Header 4 - and the author and data headers use this too  */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: Black;
+  text-align: left;
+}
+
+div.main-container {
+  max-width: 100% !important;
+}
+
+</style>
+
+
+```{r setup, echo = F }
+knitr::opts_chunk$set(echo = T)
+knitr::opts_chunk$set(cache = F)
+knitr::opts_knit$set(root.dir = '/lustre/scratch123/hgi/mdt2/teams/anderson/qz2/scratch115/for_James/')
+```
+
+
+<br>
+<br>
+
+# Load library
+```{r packages, warning=F}
+library(ggplot2)
+library(data.table)
+library(kableExtra)
+library(knitr)
+library(reshape2)
+library(dplyr)
+```
+
+# load phenotypes
+```{r warning=F,echo = F}
+setwd("/lustre/scratch123/hgi/mdt2/teams/anderson/qz2/scratch115/for_James")
+
+prs <- read.table("prs.sscore",header=F,stringsAsFactor=F)
+colnames(prs)<-c("FID","IID","NMISS_ALLELE_CT","NAMED_ALLELE_DOSAGE_SUM","SCORE1_AVG","SCORE1_SUM")
+
+#anti-TNF PNR
+pnr <- read.table("/lustre/scratch123/hgi/mdt2/teams/anderson/qz2/scratch115/proj1/analysis_22_03_2022/pheno/PNR.txt",header=T,stringsAsFactors=F)
+data <- merge(prs,pnr[,c("ID","antiTNF")],by.x="FID",by.y="ID")
+
+#age at diagnosis & behaviour & perinal disease & disease subtype
+fread("/lustre/scratch123/hgi/projects/ibdgwas_bioresource/phenotype_data/release_20220404/raw/IBD_BioRes_phenotypes_20220404.txt",stringsAsFactor=F,sep="~",header=T)->pheno
+pheno<- as.data.frame(pheno)
+data <- merge(data,pheno[,c("SPid_1","age_diag","behaviour","diagnosis","perianal")],by.x="FID",by.y="SPid_1",all.x=T)
+data[ data$behaviour==1 & !is.na(data$behaviour),"behaviour"]<-"B1"
+data[ data$behaviour==2 & !is.na(data$behaviour),"behaviour"]<-"B2"
+data[ data$behaviour==3 & !is.na(data$behaviour),"behaviour"]<-"B3"
+
+data[ data$perianal==3 & !is.na(data$perianal),"perianal"] <- NA
+data[ data$perianal==2 & !is.na(data$perianal),"perianal"] <- 0
+
+
+#CD location
+loc <- read.table("/lustre/scratch123/hgi/mdt2/teams/anderson/qz2/scratch115/CD_bahaviour/24_10_2022/pheno/gwas_behav_covar.regenie",header=T,stringsAsFactors=F)
+data <- merge(data,loc[,c("FID","loc")],by="FID",all.x=T)
+
+#UC disease extent
+extent <- read.table("/lustre/scratch123/hgi/mdt2/teams/anderson/qz2/scratch115/UC_flare/pheno/UC_flare.ccov",header=F,stringsAsFactors=F)
+colnames(extent)<-c("FID","IID","gender","era","smoke","extent")
+data <- merge(data,extent[,c("FID","extent")],by="FID",all.x=T)
+
+#disease surgery
+CDop <- pheno$surgery
+CDop[!is.na(CDop) & CDop==3]<- NA
+CDop[!is.na(CDop) & CDop==2]<- 0
+CDop_noNA <- CDop
+CDop_noNA[is.na(CDop_noNA)]<- 0
+
+UCop <- pheno$colectomy
+UCop[!is.na(UCop) & UCop==3]<- NA
+UCop[!is.na(UCop) & UCop==2]<- 0
+UCop_noNA <- UCop
+UCop_noNA[is.na(UCop_noNA)]<- 0
+
+opnum <- CDop_noNA + UCop_noNA
+opnum[is.na(CDop) & is.na(UCop)] <- NA
+opnum[!is.na(opnum) & opnum > 1]<- 1
+opcount <- data.frame(FID=pheno$SPid_1,has_op=opnum)
+
+data <- merge(data,opcount,by="FID")
+
+
+#only consider patients with CD or UC
+data <- data[ !is.na(data$diagnosis) & data$diagnosis %in% c(1:2),]
+data[ data$diagnosis==1,"diagnosis"]<-"CD"
+data[ data$diagnosis==2,"diagnosis"]<-"UC"
+
+colnames(data)[c(4,6)] <- c("Risk_allele_count","Polygenic_risk_score")
+```
+
+
+```{r, results='asis', echo = F}
+pnrnum <- c(paste0(sum(data[ data$diagnosis=="CD","antiTNF"]==0,na.rm=T),"/",sum(data[ data$diagnosis=="CD","antiTNF"]==1,na.rm=T)),
+            paste0(sum(data[ data$diagnosis=="UC","antiTNF"]==0,na.rm=T),"/",sum(data[ data$diagnosis=="UC","antiTNF"]==1,na.rm=T)))
+aadnum <- c(round(median(data[ data$diagnosis=="CD","age_diag"],na.rm=T),2),
+            round(median(data[ data$diagnosis=="UC","age_diag"],na.rm=T),2))
+cdbehnum <- c(paste0(sum(data[ data$diagnosis=="CD","behaviour"]=="B1",na.rm=T),"/",sum(data[ data$diagnosis=="CD","behaviour"]=="B2",na.rm=T),"/",sum(data[ data$diagnosis=="CD","behaviour"]=="B3",na.rm=T)),"0/0/0")
+cdlocnum <- c(paste0(sum(data[ data$diagnosis=="CD","loc"]=="L1",na.rm=T),"/",sum(data[ data$diagnosis=="CD","loc"]=="L2",na.rm=T),"/",sum(data[ data$diagnosis=="CD","loc"]=="L3",na.rm=T)),"0/0/0")
+cdperi <- c(paste0(sum(data[ data$diagnosis=="CD","perianal"]==1,na.rm=T),"/",sum(data[ data$diagnosis=="CD","perianal"]==0,na.rm=T)),"0/0")
+ucextnum <- c("0/0/0",paste0(sum(data[ data$diagnosis=="UC","extent"]=="E1",na.rm=T),"/",sum(data[ data$diagnosis=="UC","extent"]=="E2",na.rm=T),"/",sum(data[ data$diagnosis=="UC","extent"]=="E3",na.rm=T)))
+opnum <- c(paste0(sum(data[ data$diagnosis=="CD","has_op"]==1,na.rm=T),"/",sum(data[ data$diagnosis=="CD","has_op"]==0,na.rm=T)),
+            paste0(sum(data[ data$diagnosis=="UC","has_op"]==1,na.rm=T),"/",sum(data[ data$diagnosis=="UC","has_op"]==0,na.rm=T)))
+datasmy <- rbind.data.frame(pnrnum,aadnum,cdbehnum,cdlocnum,cdperi,ucextnum,opnum)
+row.names(datasmy)<-c("Anti-TNF: PNR/PR","Age at diagnosis: median","CD behaviour: B1/B2/B3","CD location: L1/L2/L3","CD perinal: YES/NO","UC extent: E1/E2/E3","Surgery: YES/NO")
+colnames(datasmy)<-c(paste0("Crohn's disease, N = ",sum(data$diagnosis=="CD")),paste0("Ulcerative colitis, N = ",sum(data$diagnosis=="UC")))
+
+
+kable(datasmy,caption = "Number of genotyped samples with different types of variables") %>% kable_styling(bootstrap_options = c("striped", "hover"),full_width = F)
+```
+# the relationship between PRS and IBD subtype (CD v.s. UC)
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(as.double(diagnosis=="CD") ~ Risk_allele_count, data=data))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(as.double(diagnosis=="CD") ~ Polygenic_risk_score, data=data))
+print(weight_smy)
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 1. Distribution of PRS in patients with different IBD subtypes",warning=F,echo=F}
+
+dataplot <- data[,c("Risk_allele_count","Polygenic_risk_score","diagnosis")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$diagnosis=="UC","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$diagnosis=="UC","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=diagnosis))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer(palette="Set2")
+
+ggsave("figures/disease_subtype.pdf",width = 12, height = 8,dpi=300)
+```
+
+# the relationship between PRS and anti-TNF PNR
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(antiTNF ~ Risk_allele_count + diagnosis, data=data))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(antiTNF ~ Polygenic_risk_score + diagnosis, data=data))
+print(weight_smy)
+
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 2. Distribution of PRS in patients with different anti-TNF primary responses",warning=F,echo=F}
+dataplot <- data[,c("Risk_allele_count","Polygenic_risk_score","antiTNF")]
+dataplot <- dataplot[!is.na(dataplot$antiTNF),]
+dataplot[dataplot$antiTNF==1,"antiTNF"] <- "PR"
+dataplot[dataplot$antiTNF==0,"antiTNF"] <- "PNR"
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$antiTNF=="PR","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$antiTNF=="PR","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=antiTNF))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("Anti-TNF",palette="Set2")
+
+ggsave("figures/disease_antiTNF.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+# the relationship between PRS and Age at diagnosis
+```{r}
+#unweighted PRS
+unweight_smy <- summary(lm(age_diag ~ Risk_allele_count + diagnosis, data=data))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(lm(age_diag ~ Polygenic_risk_score + diagnosis, data=data))
+print(weight_smy)
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 3. The relationship between PRS and Age at diagnosis",warning=F,echo=F}
+dataplot <- data[,c("Risk_allele_count","Polygenic_risk_score","age_diag")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),ypos=c(85,85),xpos=c(22.5,2.5))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value,age_diag))+
+  geom_point()+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Age at diagnosis")+scale_fill_brewer(palette="Set2")+
+  geom_smooth(method = "lm",se = F,lty=2)
+
+ggsave("figures/disease_aad.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+
+# the relationship between PRS and CD behaviour (B1 v.s. B2/B3)
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(as.double(behaviour!="B1") ~ Risk_allele_count, data=data[ data$diagnosis=="CD",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(as.double(behaviour!="B1") ~ Polygenic_risk_score, data=data[ data$diagnosis=="CD",]))
+print(weight_smy)
+
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 4. Distribution of PRS in patients with different CD behaviour",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="CD",c("Risk_allele_count","Polygenic_risk_score","behaviour")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+dataplotm <- dataplotm[!is.na(dataplotm$behaviour),]
+ 
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$behaviour=="B1","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$behaviour=="B1","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill= as.factor(behaviour!="B1")))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", signif(pval,digits=3))),size=5)+
+  ylab("Density")+scale_fill_brewer("CD behaviour",labels=c("B1","B2/B3"),palette="Set2")
+
+ggsave("figures/disease_beh_b1vsB23.pdf",width = 12, height = 8,dpi=300)
+```
+
+# the relationship between PRS and perianal disease
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(perianal ~ Risk_allele_count, data=data[data$diagnosis=="CD",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(perianal ~ Polygenic_risk_score, data=data[ data$diagnosis=="CD",]))
+print(weight_smy)
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 5. Distribution of PRS in patients with perianal disease",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="CD",c("Risk_allele_count","Polygenic_risk_score","perianal")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+dataplotm <- dataplotm[!is.na(dataplotm$perianal),]
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$perianal==0,"value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$perianal==0,"value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=as.factor(perianal)))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("Perianal disease",labels=c("No","Yes"),palette="Set2")
+
+ggsave("figures/disease_perianal.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+# the relationship between PRS and CD location
+```{r}
+#unweighted PRS
+unweight_smy <- summary(aov(Risk_allele_count ~ loc, data=data[data$diagnosis=="CD",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(aov(Polygenic_risk_score ~ loc, data=data[ data$diagnosis=="CD",]))
+print(weight_smy)
+```
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 6. Distribution of PRS in patients with different CD location",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="CD",c("Risk_allele_count","Polygenic_risk_score","loc")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+dataplotm <- dataplotm[!is.na(dataplotm$loc),]
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy[[1]][["Pr(>F)"]][1],weight_smy[[1]][["Pr(>F)"]][1]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$loc=="L2","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$loc=="L2","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=loc))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("CD location",palette="Set2")
+
+ggsave("figures/disease_loc.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+# the relationship between PRS and UC extent
+```{r}
+#unweighted PRS
+unweight_smy <- summary(aov(Risk_allele_count ~ extent, data=data[data$diagnosis=="UC",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(aov(Polygenic_risk_score ~ extent, data=data[ data$diagnosis=="UC",]))
+print(weight_smy)
+
+```
+
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 7. Distribution of PRS in patients with different UC extent",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="UC",c("Risk_allele_count","Polygenic_risk_score","extent")]
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+dataplotm <- dataplotm[!is.na(dataplotm$extent),]
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy[[1]][["Pr(>F)"]][1],weight_smy[[1]][["Pr(>F)"]][1]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$extent=="E3","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$extent=="E2","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=extent))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("UC extent",palette="Set2")
+
+ggsave("figures/disease_extent.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+# the relationship between PRS and surgery
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(has_op ~ Risk_allele_count + diagnosis, data=data))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(has_op ~ Polygenic_risk_score + diagnosis, data=data))
+print(weight_smy)
+```
+
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 8. Distribution of PRS in patients with or without surgery",warning=F,echo=F}
+dataplot <- data[,c("Risk_allele_count","Polygenic_risk_score","has_op")]
+dataplot <- dataplot[!is.na(dataplot$has_op),]
+dataplot[dataplot$has_op==1,"has_op"] <- "Yes"
+dataplot[dataplot$has_op==0,"has_op"] <- "No"
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$has_op=="No","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$has_op=="No","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=has_op))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("Surgery",palette="Set2")
+
+ggsave("figures/disease_surgery.pdf",width = 12, height = 8,dpi=300)
+```
+
+
+# the relationship between PRS and surgery in CD
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(has_op ~ Risk_allele_count, data=data[ data$diagnosis=="CD",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(has_op ~ Polygenic_risk_score, data=data[ data$diagnosis=="CD",]))
+print(weight_smy)
+```
+
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 9. Distribution of PRS in CD patients with or without surgery",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="CD",c("Risk_allele_count","Polygenic_risk_score","has_op")]
+dataplot <- dataplot[!is.na(dataplot$has_op),]
+dataplot[dataplot$has_op==1,"has_op"] <- "Yes"
+dataplot[dataplot$has_op==0,"has_op"] <- "No"
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$has_op=="No","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$has_op=="No","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=has_op))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("Surgery in CD",palette="Set2")
+
+ggsave("figures/disease_surgery_CD.pdf",width = 12, height = 8,dpi=300)
+```
+
+# the relationship between PRS and surgery in UC
+```{r}
+#unweighted PRS
+unweight_smy <- summary(glm(has_op ~ Risk_allele_count, data=data[ data$diagnosis=="UC",]))
+print(unweight_smy)
+
+#weighted PRS
+weight_smy <- summary(glm(has_op ~ Polygenic_risk_score, data=data[ data$diagnosis=="UC",]))
+print(weight_smy)
+```
+
+
+```{r,fig.width=12, fig.height=9, fig.cap="Figure 10. Distribution of PRS in UC patients with or without surgery",warning=F,echo=F}
+dataplot <- data[data$diagnosis=="UC",c("Risk_allele_count","Polygenic_risk_score","has_op")]
+dataplot <- dataplot[!is.na(dataplot$has_op),]
+dataplot[dataplot$has_op==1,"has_op"] <- "Yes"
+dataplot[dataplot$has_op==0,"has_op"] <- "No"
+dataplotm <- melt(dataplot,measure.vars =  c("Risk_allele_count","Polygenic_risk_score"))
+
+pvals <- data.frame(variable=c("Risk allele count","Polygenic risk score"),
+                    pval=c(unweight_smy$coefficients[2,4],weight_smy$coefficients[2,4]),xpos=c(22.5,2.5),ypos=c(max(density(dataplotm[dataplotm$variable=="Risk_allele_count" & dataplotm$has_op=="No","value"])$y)*.9,max(density(dataplotm[dataplotm$variable=="Polygenic_risk_score" & dataplotm$has_op=="No","value"])$y)*.9))
+
+dataplotm$variable <- gsub("_"," ",dataplotm$variable)
+ggplot(data=dataplotm,aes(value))+
+  geom_density(alpha=0.5,aes(fill=has_op))+theme_bw()+
+  theme(axis.title.y = element_text(face="bold",size=14),
+        axis.title.x = element_blank(),
+        axis.text = element_text(face="bold",size=14),
+        strip.text = element_text(face="bold",size=14),
+        legend.text=element_text(face="bold",size=14),
+        legend.title=element_text(face="bold",size=14),
+        legend.position = "bottom")+
+  facet_wrap(~variable,ncol=2,scale="free")+
+  geom_text(data=pvals,
+            aes(x=xpos,y=ypos, label=paste0("P = ", formatC(pval, format = "e", digits = 2))),size=5)+
+  ylab("Density")+scale_fill_brewer("Surgery in UC",palette="Set2")
+
+ggsave("figures/disease_surgery_UC.pdf",width = 12, height = 8,dpi=300)
+```
